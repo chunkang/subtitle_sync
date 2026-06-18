@@ -44,6 +44,24 @@ VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
 SUBTITLE_EXTS = (".srt", ".vtt")
 SYNCED_TAG = ".synced"
 
+# Alignment strategies tried in order. We score each result against our own
+# speech detection and keep the best, stopping early once one is good enough.
+#   - default (subs_then_webrtc) uses any embedded subtitle track in the video
+#     as the reference, which is great when it exists and correctly timed but
+#     misleads when it doesn't (a common cause of "synced but totally off").
+#   - webrtc / auditok force pure audio-based detection, sidestepping that.
+#   - gss adds golden-section search for a framerate ratio mismatch.
+ALIGN_STRATEGIES = [
+    ("default", []),
+    ("vad=webrtc", ["--vad", "webrtc"]),
+    ("vad=auditok", ["--vad", "auditok"]),
+    ("gss", ["--gss"]),
+]
+# Our overlap score (0-100) at/above which a strategy is accepted without
+# trying the rest, and below which the final result is flagged as unreliable.
+EARLY_ACCEPT_SCORE = 90
+LOW_QUALITY_SCORE = 75
+
 
 # ---------- bootstrap ----------
 
@@ -196,7 +214,9 @@ def _parse_vtt_ts(ts):
 
 
 def parse_cues(path):
-    text = path.read_text(encoding="utf-8")
+    # utf-8-sig transparently strips a leading BOM (common in subtitles
+    # exported from Windows tools) while still decoding plain UTF-8.
+    text = path.read_text(encoding="utf-8-sig")
     ext = path.suffix.lower()
     if ext == ".srt":
         arrow_re = re.compile(
@@ -227,6 +247,41 @@ def parse_cues(path):
             cues.append((start, end, " ".join(body)))
         else:
             i += 1
+    return cues
+
+
+def validate_subtitle(path):
+    """Sanity-check that a subtitle file is well-formed before syncing.
+
+    Returns the parsed cues on success and raises ValueError (with a
+    human-readable reason) otherwise. ffsubsync happily emits a garbage
+    "synced" file when handed an empty, wrong-encoding, or malformed
+    subtitle, so we'd rather fail loudly here than after the slow audio
+    analysis has run.
+    """
+    ext = path.suffix.lower()
+    if ext not in SUBTITLE_EXTS:
+        raise ValueError("unsupported subtitle extension {0!r}".format(ext))
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("not valid UTF-8 text ({0})".format(exc))
+    if not text.strip():
+        raise ValueError("file is empty")
+    if ext == ".vtt" and not text.lstrip().upper().startswith("WEBVTT"):
+        raise ValueError("missing 'WEBVTT' header")
+    if "-->" not in text:
+        raise ValueError("no subtitle timing lines ('-->') found")
+    cues = parse_cues(path)
+    if not cues:
+        raise ValueError("no cues could be parsed (malformed timestamps?)")
+    bad = sum(1 for cs, ce, _ in cues if ce <= cs or cs < 0)
+    if bad * 2 > len(cues):
+        raise ValueError(
+            "{0} of {1} cues have invalid timing (end <= start or negative)".format(
+                bad, len(cues)
+            )
+        )
     return cues
 
 
@@ -312,17 +367,19 @@ def _clean_old_reports(video):
             f.unlink()
 
 
-def write_report(video, subtitle, synced, cues, speech, score):
+def write_report(video, subtitle, synced, cues, speech, score, strategy="default"):
     _clean_old_reports(video)
     report = video.with_name("{0}.report.{1:03d}.txt".format(video.stem, score))
 
+    quality = "ok" if score >= LOW_QUALITY_SCORE else "LOW - sync may be unreliable"
     lines = [
         "subtitle sync report",
         "",
         "video:    {0}".format(video.name),
         "subtitle: {0}".format(subtitle.name),
         "synced:   {0}".format(synced.name),
-        "score:    {0}%".format(score),
+        "strategy: {0}".format(strategy),
+        "score:    {0}% ({1})".format(score, quality),
         "cues:     {0}".format(len(cues)),
         "",
     ]
@@ -382,6 +439,10 @@ def resolve_inputs(args):
                     "error: no subtitle file found for {0}\n"
                     "       expected {1}.srt or {1}.vtt".format(video.name, video.stem)
                 )
+            try:
+                validate_subtitle(sub)
+            except ValueError as exc:
+                sys.exit("error: {0}: {1}".format(sub.name, exc))
             pairs.append((video, sub))
         return pairs
     found = find_pairs(Path.cwd())
@@ -390,25 +451,77 @@ def resolve_inputs(args):
             "no video+subtitle pairs found in the current directory.\n"
             "usage: subtitle_sync [video ...]"
         )
-    return found
+    pairs = []
+    for video, sub in found:
+        try:
+            validate_subtitle(sub)
+        except ValueError as exc:
+            print("[subsync] skipping {0}: {1}".format(sub.name, exc))
+            continue
+        pairs.append((video, sub))
+    if not pairs:
+        sys.exit("no valid video+subtitle pairs to sync.")
+    return pairs
 
 
 # ---------- sync ----------
+
+def _run_ffsubsync(video, subtitle, out_path, extra_args):
+    # ffsubsync ships a console entry point but no runnable __main__, so invoke
+    # the binary installed alongside the (venv) interpreter rather than -m.
+    ffsubsync_bin = Path(sys.executable).with_name("ffsubsync")
+    subprocess.run(
+        [str(ffsubsync_bin), str(video), "-i", str(subtitle), "-o", str(out_path)]
+        + list(extra_args),
+        check=True,
+    )
+
 
 def sync_one(video, subtitle, speech):
     ext = subtitle.suffix
     synced = video.with_name(video.stem + SYNCED_TAG + ext)
     print("[subsync] syncing {0} -> {1}".format(subtitle.name, synced.name))
-    subprocess.run(
-        [sys.executable, "-m", "ffsubsync",
-         str(video), "-i", str(subtitle), "-o", str(synced)],
-        check=True,
-    )
-    print("[subsync] wrote {0}".format(synced.name))
 
-    cues = parse_cues(synced)
-    score = compute_score(cues, speech)
-    report = write_report(video, subtitle, synced, cues, speech, score)
+    best = None  # {"score", "cues", "label", "path"}
+    tmp_dir = Path(tempfile.mkdtemp(prefix="subsync_"))
+    try:
+        for label, extra in ALIGN_STRATEGIES:
+            candidate = tmp_dir / ("candidate" + ext)
+            print("[subsync]   trying strategy: {0}".format(label))
+            try:
+                _run_ffsubsync(video, subtitle, candidate, extra)
+            except subprocess.CalledProcessError as exc:
+                print("[subsync]   strategy {0} failed ({1}); skipping".format(label, exc))
+                continue
+            if not candidate.exists():
+                print("[subsync]   strategy {0} produced no output; skipping".format(label))
+                continue
+            cues = parse_cues(candidate)
+            score = compute_score(cues, speech)
+            print("[subsync]   strategy {0} scored {1}%".format(label, score))
+            if best is None or score > best["score"]:
+                # Stash a copy; the next strategy overwrites `candidate`.
+                kept = tmp_dir / ("best" + ext)
+                shutil.copyfile(str(candidate), str(kept))
+                best = {"score": score, "cues": cues, "label": label, "path": kept}
+            if score >= EARLY_ACCEPT_SCORE:
+                break
+        if best is None:
+            sys.exit("error: all alignment strategies failed for {0}".format(subtitle.name))
+        shutil.copyfile(str(best["path"]), str(synced))
+    finally:
+        shutil.rmtree(str(tmp_dir), ignore_errors=True)
+
+    score = best["score"]
+    label = best["label"]
+    print("[subsync] wrote {0} (strategy: {1}, score: {2}%)".format(synced.name, label, score))
+    if score < LOW_QUALITY_SCORE:
+        print(
+            "[subsync] WARNING: best alignment for {0} scored only {1}%; the sync "
+            "may be unreliable.".format(subtitle.name, score)
+        )
+
+    report = write_report(video, subtitle, synced, best["cues"], speech, score, label)
     print("[subsync] report: {0} (score: {1}%)".format(report.name, score))
 
 
