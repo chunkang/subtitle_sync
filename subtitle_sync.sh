@@ -58,9 +58,13 @@ VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
 SUBTITLE_EXTS = (".srt", ".vtt")
 SYNCED_TAG = ".synced"
 
-# Whisper model used to locate dialogue. large-v3 is the most accurate (and
-# slowest); tiny/base/small/medium trade accuracy for speed.
-WHISPER_MODEL = "large-v3"
+# Whisper model used to locate dialogue. We only keep each segment's start/end
+# timing (the transcribed text is discarded), so we don't need large-v3's text
+# accuracy -- medium's speech *boundaries* track dialogue nearly as well while
+# running noticeably faster on CPU. tiny < base < small < medium < large-v3
+# trade speed for accuracy; override with SUBSYNC_WHISPER_MODEL (e.g. "small"
+# to go faster, "large-v3" for a noisy mix).
+WHISPER_MODEL = os.environ.get("SUBSYNC_WHISPER_MODEL", "medium")
 
 # ffsubsync samples speech at 100 Hz (see ffsubsync.constants.SAMPLE_RATE); the
 # reference array we hand it must use the same rate.
@@ -331,7 +335,10 @@ def detect_speech_ranges(video):
 
     print("[subsync] loading whisper model: {0} (downloads on first use)".format(
         WHISPER_MODEL))
-    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    model = WhisperModel(
+        WHISPER_MODEL, device="cpu", compute_type="int8",
+        cpu_threads=os.cpu_count() or 0,
+    )
     print("[subsync] transcribing {0} to locate dialogue (this can take a "
           "while)".format(video.name))
     segments, info = model.transcribe(
