@@ -334,15 +334,36 @@ def detect_speech_ranges(video):
     model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     print("[subsync] transcribing {0} to locate dialogue (this can take a "
           "while)".format(video.name))
-    segments, _info = model.transcribe(
+    segments, info = model.transcribe(
         str(video),
         vad_filter=True,
         condition_on_previous_text=False,
     )
+    # faster-whisper yields segments lazily as the audio is processed, so we can
+    # report progress by comparing each segment's end against the total media
+    # duration. info.duration is the portion Whisper will actually scan (after
+    # VAD), which is what the timestamps run up to.
+    total = float(getattr(info, "duration", 0.0)) or 0.0
     speech = []
+    last_pct = -1
+    stderr_tty = sys.stderr.isatty()
     for seg in segments:
         if seg.text and seg.text.strip():
             speech.append((float(seg.start), float(seg.end)))
+        if total > 0:
+            pct = min(100, int(seg.end / total * 100))
+            if pct != last_pct:
+                last_pct = pct
+                msg = "[subsync] transcribing... {0:3d}% ({1} / {2})".format(
+                    pct, _fmt_ts(seg.end), _fmt_ts(total))
+                if stderr_tty:
+                    sys.stderr.write("\r" + msg)
+                    sys.stderr.flush()
+                else:
+                    print(msg)
+    if stderr_tty and last_pct >= 0:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
     print("[subsync] found {0} dialogue segment(s)".format(len(speech)))
     return speech
 
