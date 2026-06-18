@@ -12,6 +12,37 @@ if [[ ! -f "$SOURCE" ]]; then
   exit 1
 fi
 
+# subtitle_sync needs a python3 interpreter (>=3.6). CentOS 7 ships only
+# python2 by default, so force-install python3 via the system package manager
+# when it is missing. Everything else (pip, ffsubsync, ffmpeg) is bootstrapped
+# by the script itself at first run.
+ensure_python3() {
+  if command -v python3 >/dev/null 2>&1; then
+    return
+  fi
+  echo "python3 not found; attempting to install it..."
+  local sudo=""
+  if [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+    sudo="sudo"
+  fi
+  if command -v dnf >/dev/null 2>&1; then
+    $sudo dnf install -y python3
+  elif command -v yum >/dev/null 2>&1; then
+    $sudo yum install -y python3                       # CentOS 7 / RHEL 7
+  elif command -v apt-get >/dev/null 2>&1; then
+    $sudo apt-get update && $sudo apt-get install -y python3
+  elif command -v zypper >/dev/null 2>&1; then
+    $sudo zypper install -y python3
+  elif command -v brew >/dev/null 2>&1; then
+    brew install python
+  else
+    echo "error: no supported package manager found; install python3 manually" >&2
+    exit 1
+  fi
+}
+
+ensure_python3
+
 mkdir -p "$DEST_DIR"
 install -m 0755 "$SOURCE" "$DEST"
 echo "installed: $DEST"
