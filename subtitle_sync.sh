@@ -5,6 +5,8 @@ Given video files and their associated subtitle files (.srt or .vtt),
 uses ffsubsync to re-time the subtitles to match the audio. Writes the
 synced subtitle next to the original with a .synced suffix and a report
 file named <stem>.report.<score>.txt where score is 000-100.
+
+Author: Chun Kang <kurapa@kurapa.com>
 """
 
 from __future__ import annotations
