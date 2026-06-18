@@ -2,9 +2,16 @@
 """Synchronize subtitle timing to match video audio.
 
 Given video files and their associated subtitle files (.srt or .vtt),
-uses ffsubsync to re-time the subtitles to match the audio. Writes the
-synced subtitle next to the original with a .synced suffix and a report
-file named <stem>.report.<score>.txt where score is 000-100.
+re-times the subtitles to match the spoken dialogue. Writes the synced
+subtitle next to the original with a .synced suffix and a report file
+named <stem>.report.<score>.txt where score is 000-100.
+
+Timing reference comes from Whisper (faster-whisper): it transcribes the
+audio to locate where dialogue actually occurs, which -- unlike energy or
+generic voice-activity detection -- ignores music, laughter, and sound
+effects. That speech timeline is rasterized into a reference signal and
+ffsubsync aligns the subtitle (offset + framerate) against it. The
+subtitle's own text is never changed; only its timing.
 
 Runs on Python 3.6+ so it works on older distros (e.g. CentOS 7's EPEL
 python3) as well as current ones. Missing runtime pieces (pip, ffmpeg)
@@ -14,6 +21,13 @@ Author: Chun Kang <kurapa@kurapa.com>
 """
 
 import os
+
+# Quiet the "unauthenticated requests to the HF Hub / set a HF_TOKEN" advisory
+# faster-whisper emits while downloading models. Set before any huggingface_hub
+# import so it takes effect; downloads work fine without a token.
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
 import platform
 import re
 import shutil
@@ -29,7 +43,7 @@ CACHE_DIR = Path.home() / ".cache" / "subtitle_sync"
 VENV_DIR = CACHE_DIR / "venv"
 FFMPEG_DIR = CACHE_DIR / "ffmpeg"
 VENV_MARKER = "SUBSYNC_IN_VENV"
-PIP_PACKAGES = ["ffsubsync"]
+PIP_PACKAGES = ["ffsubsync", "faster-whisper", "numpy"]
 
 # Static ffmpeg builds for Linux (e.g. Amazon Linux 2023, which has no ffmpeg
 # in its default repos, and CentOS 7, whose glibc is too old for many wheels).
@@ -44,23 +58,30 @@ VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
 SUBTITLE_EXTS = (".srt", ".vtt")
 SYNCED_TAG = ".synced"
 
-# Alignment strategies tried in order. We score each result against our own
-# speech detection and keep the best, stopping early once one is good enough.
-#   - default (subs_then_webrtc) uses any embedded subtitle track in the video
-#     as the reference, which is great when it exists and correctly timed but
-#     misleads when it doesn't (a common cause of "synced but totally off").
-#   - webrtc / auditok force pure audio-based detection, sidestepping that.
-#   - gss adds golden-section search for a framerate ratio mismatch.
+# Whisper model used to locate dialogue. large-v3 is the most accurate (and
+# slowest); tiny/base/small/medium trade accuracy for speed.
+WHISPER_MODEL = "large-v3"
+
+# ffsubsync samples speech at 100 Hz (see ffsubsync.constants.SAMPLE_RATE); the
+# reference array we hand it must use the same rate.
+REFERENCE_HZ = 100
+
+# Alignment passes tried against the Whisper-derived reference, in order. The
+# reference (the expensive Whisper step) is built once; these only re-run the
+# near-instant ffsubsync offset/framerate search. gss adds a golden-section
+# search for a framerate-ratio mismatch (common with PAL/NTSC broadcast subs).
 ALIGN_STRATEGIES = [
-    ("default", []),
-    ("vad=webrtc", ["--vad", "webrtc"]),
-    ("vad=auditok", ["--vad", "auditok"]),
-    ("gss", ["--gss"]),
+    ("whisper-ref", []),
+    ("whisper-ref+gss", ["--gss"]),
 ]
-# Our overlap score (0-100) at/above which a strategy is accepted without
-# trying the rest, and below which the final result is flagged as unreliable.
+# Our overlap score (0-100) at/above which a pass is accepted without trying
+# the rest, and below which the final result is flagged as unreliable. Overlap
+# is the fraction of cue time landing on Whisper-detected dialogue.
 EARLY_ACCEPT_SCORE = 90
 LOW_QUALITY_SCORE = 75
+# ffsubsync's alignment score is not comparable across files, but its sign is
+# meaningful: a value at or below this is anti-correlated, i.e. a wrong sync.
+MIN_FFSUBSYNC_SCORE = 0.0
 
 
 # ---------- bootstrap ----------
@@ -298,34 +319,51 @@ def _get_duration(video):
 
 
 def detect_speech_ranges(video):
-    print("[subsync] detecting speech ranges in {0}".format(video.name))
-    result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-i", str(video),
-         "-af", "silencedetect=noise=-30dB:d=0.5",
-         "-f", "null", "-"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        universal_newlines=True,
-    )
-    silence_starts = []
-    silence_ranges = []
-    for line in result.stderr.splitlines():
-        m = re.search(r"silence_start:\s*(\S+)", line)
-        if m:
-            silence_starts.append(float(m.group(1)))
-        m = re.search(r"silence_end:\s*(\S+)", line)
-        if m and silence_starts:
-            silence_ranges.append((silence_starts.pop(0), float(m.group(1))))
+    """Locate spoken dialogue in a video, returning [(start, end)] in seconds.
 
-    duration = _get_duration(video)
+    Whisper transcribes the audio with its own VAD filter, so the segments it
+    returns track actual speech and skip music / laughter / sound effects --
+    the failure mode of energy- or webrtc-based detection on dense content. We
+    keep only the segment timings; the transcribed text is discarded (we sync
+    the user's existing subtitle, we don't replace it).
+    """
+    from faster_whisper import WhisperModel
+
+    print("[subsync] loading whisper model: {0} (downloads on first use)".format(
+        WHISPER_MODEL))
+    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    print("[subsync] transcribing {0} to locate dialogue (this can take a "
+          "while)".format(video.name))
+    segments, _info = model.transcribe(
+        str(video),
+        vad_filter=True,
+        condition_on_previous_text=False,
+    )
     speech = []
-    prev = 0.0
-    for ss, se in sorted(silence_ranges):
-        if ss > prev:
-            speech.append((prev, ss))
-        prev = se
-    if prev < duration:
-        speech.append((prev, duration))
+    for seg in segments:
+        if seg.text and seg.text.strip():
+            speech.append((float(seg.start), float(seg.end)))
+    print("[subsync] found {0} dialogue segment(s)".format(len(speech)))
     return speech
+
+
+def build_reference(speech, duration, path):
+    """Rasterize speech ranges into ffsubsync's reference format.
+
+    ffsubsync accepts a .npz holding a 'speech' array sampled at REFERENCE_HZ,
+    where frames >= 1.0 are speech. Aligning against this lets ffsubsync do its
+    robust offset + framerate search using the Whisper timeline as ground truth.
+    """
+    import numpy as np
+
+    n = max(1, int(round(duration * REFERENCE_HZ)))
+    arr = np.zeros(n, dtype=np.float32)
+    for s, e in speech:
+        a = max(0, int(round(s * REFERENCE_HZ)))
+        b = min(n, int(round(e * REFERENCE_HZ)))
+        if b > a:
+            arr[a:b] = 1.0
+    np.savez(str(path), speech=arr)
 
 
 # ---------- scoring & report ----------
@@ -367,20 +405,36 @@ def _clean_old_reports(video):
             f.unlink()
 
 
-def write_report(video, subtitle, synced, cues, speech, score, strategy="default"):
+def write_report(video, subtitle, synced, cues, speech, score, strategy="default",
+                 ff_score=None, ff_offset=None, trustworthy=True,
+                 dropped=0, orig_count=None, overlap=None, coverage=None):
     _clean_old_reports(video)
     report = video.with_name("{0}.report.{1:03d}.txt".format(video.stem, score))
 
-    quality = "ok" if score >= LOW_QUALITY_SCORE else "LOW - sync may be unreliable"
+    quality = "ok" if trustworthy else "LOW - sync may be wrong"
+    if orig_count is None:
+        orig_count = len(cues)
+    if overlap is None:
+        overlap = score
+    if coverage is None:
+        coverage = 1.0
+    ff_offset_desc = "n/a" if ff_offset is None else "{0:.3f}s".format(ff_offset)
+    cues_desc = "{0}".format(len(cues))
+    if dropped > 0:
+        cues_desc += " ({0} of {1} dropped before 0:00)".format(dropped, orig_count)
     lines = [
         "subtitle sync report",
         "",
-        "video:    {0}".format(video.name),
-        "subtitle: {0}".format(subtitle.name),
-        "synced:   {0}".format(synced.name),
-        "strategy: {0}".format(strategy),
-        "score:    {0}% ({1})".format(score, quality),
-        "cues:     {0}".format(len(cues)),
+        "video:     {0}".format(video.name),
+        "subtitle:  {0}".format(subtitle.name),
+        "synced:    {0}".format(synced.name),
+        "reference: whisper {0}, {1} dialogue segment(s)".format(
+            WHISPER_MODEL, len(speech)),
+        "strategy:  {0}".format(strategy),
+        "ffsubsync: score {0}, offset {1}".format(_fmt_ff_score(ff_score), ff_offset_desc),
+        "score:     {0}% ({1})".format(score, quality),
+        "           overlap {0}% x coverage {1:.0f}%".format(overlap, coverage * 100),
+        "cues:      {0}".format(cues_desc),
         "",
     ]
     for i, (start, end, text) in enumerate(cues, 1):
@@ -466,30 +520,66 @@ def resolve_inputs(args):
 
 # ---------- sync ----------
 
-def _run_ffsubsync(video, subtitle, out_path, extra_args):
-    # ffsubsync ships a console entry point but no runnable __main__, so invoke
-    # the binary installed alongside the (venv) interpreter rather than -m.
+_FF_SCORE_RE = re.compile(r"\bscore:\s*(-?\d+(?:\.\d+)?)")
+_FF_OFFSET_RE = re.compile(r"offset seconds:\s*(-?\d+(?:\.\d+)?)")
+
+
+def _run_ffsubsync(reference, subtitle, out_path, extra_args):
+    """Run ffsubsync, returning (ff_score, ff_offset) parsed from its output.
+
+    `reference` is the .npz speech array built from the Whisper timeline.
+    ffsubsync ships a console entry point but no runnable __main__, so invoke
+    the binary installed alongside the (venv) interpreter rather than -m. Its
+    score is not comparable across files, but the sign matters: negative means
+    the alignment is anti-correlated (wrong). Either value may be None if it
+    could not be parsed.
+    """
     ffsubsync_bin = Path(sys.executable).with_name("ffsubsync")
-    subprocess.run(
-        [str(ffsubsync_bin), str(video), "-i", str(subtitle), "-o", str(out_path)]
+    result = subprocess.run(
+        [str(ffsubsync_bin), str(reference), "-i", str(subtitle), "-o", str(out_path)]
         + list(extra_args),
-        check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True, check=True,
     )
+    out = result.stdout or ""
+    scores = _FF_SCORE_RE.findall(out)
+    offsets = _FF_OFFSET_RE.findall(out)
+    ff_score = float(scores[-1]) if scores else None
+    ff_offset = float(offsets[-1]) if offsets else None
+    return ff_score, ff_offset
+
+
+def _trust_tier(ff_score):
+    # 2 = ffsubsync trusts it, 1 = unknown (unparsed), 0 = anti-correlated.
+    if ff_score is None:
+        return 1
+    return 2 if ff_score > MIN_FFSUBSYNC_SCORE else 0
+
+
+def _fmt_ff_score(ff_score):
+    return "n/a" if ff_score is None else "{0:.0f}".format(ff_score)
 
 
 def sync_one(video, subtitle, speech):
     ext = subtitle.suffix
     synced = video.with_name(video.stem + SYNCED_TAG + ext)
     print("[subsync] syncing {0} -> {1}".format(subtitle.name, synced.name))
+    if not speech:
+        sys.exit("error: no dialogue detected in {0}; cannot sync".format(video.name))
 
-    best = None  # {"score", "cues", "label", "path"}
+    orig_count = len(parse_cues(subtitle))
+    duration = _get_duration(video)
+
+    best = None  # candidate dict; ranked by (tier, overlap)
     tmp_dir = Path(tempfile.mkdtemp(prefix="subsync_"))
     try:
+        reference = tmp_dir / "reference.npz"
+        build_reference(speech, duration, reference)
         for label, extra in ALIGN_STRATEGIES:
             candidate = tmp_dir / ("candidate" + ext)
             print("[subsync]   trying strategy: {0}".format(label))
             try:
-                _run_ffsubsync(video, subtitle, candidate, extra)
+                ff_score, ff_offset = _run_ffsubsync(reference, subtitle, candidate, extra)
             except subprocess.CalledProcessError as exc:
                 print("[subsync]   strategy {0} failed ({1}); skipping".format(label, exc))
                 continue
@@ -497,14 +587,29 @@ def sync_one(video, subtitle, speech):
                 print("[subsync]   strategy {0} produced no output; skipping".format(label))
                 continue
             cues = parse_cues(candidate)
-            score = compute_score(cues, speech)
-            print("[subsync]   strategy {0} scored {1}%".format(label, score))
-            if best is None or score > best["score"]:
-                # Stash a copy; the next strategy overwrites `candidate`.
+            overlap = compute_score(cues, speech)
+            # Cues shifted before 0:00 are dropped by ffsubsync; scoring only the
+            # survivors would reward a wildly wrong offset that keeps just one
+            # well-placed cue. Fold coverage in so losing cues tanks the score.
+            coverage = len(cues) / float(orig_count) if orig_count else 0.0
+            effective = int(round(overlap * coverage))
+            tier = _trust_tier(ff_score)
+            print("[subsync]   strategy {0}: score {1}% (overlap {2}%, coverage "
+                  "{3:.0f}%), ffsubsync score {4}, offset {5}".format(
+                      label, effective, overlap, coverage * 100,
+                      _fmt_ff_score(ff_score),
+                      "n/a" if ff_offset is None else "{0:.1f}s".format(ff_offset)))
+            cand = {"overlap": overlap, "coverage": coverage, "effective": effective,
+                    "cues": cues, "label": label, "tier": tier,
+                    "ff_score": ff_score, "ff_offset": ff_offset, "path": None}
+            # Prefer an alignment ffsubsync trusts; break ties by effective score.
+            if best is None or (tier, effective) > (best["tier"], best["effective"]):
                 kept = tmp_dir / ("best" + ext)
                 shutil.copyfile(str(candidate), str(kept))
-                best = {"score": score, "cues": cues, "label": label, "path": kept}
-            if score >= EARLY_ACCEPT_SCORE:
+                cand["path"] = kept
+                best = cand
+            # Only stop early when ffsubsync trusts it AND nearly all cues survived.
+            if tier == 2 and effective >= EARLY_ACCEPT_SCORE:
                 break
         if best is None:
             sys.exit("error: all alignment strategies failed for {0}".format(subtitle.name))
@@ -512,17 +617,30 @@ def sync_one(video, subtitle, speech):
     finally:
         shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
-    score = best["score"]
-    label = best["label"]
-    print("[subsync] wrote {0} (strategy: {1}, score: {2}%)".format(synced.name, label, score))
-    if score < LOW_QUALITY_SCORE:
+    effective = best["effective"]
+    dropped = orig_count - len(best["cues"])
+    trustworthy = best["tier"] == 2 and effective >= LOW_QUALITY_SCORE
+    print("[subsync] wrote {0} (strategy: {1}, score {2}%, overlap {3}%, "
+          "ffsubsync score {4})".format(
+              synced.name, best["label"], effective, best["overlap"],
+              _fmt_ff_score(best["ff_score"])))
+    if not trustworthy:
         print(
-            "[subsync] WARNING: best alignment for {0} scored only {1}%; the sync "
-            "may be unreliable.".format(subtitle.name, score)
+            "[subsync] WARNING: alignment for {0} looks unreliable (score {1}%, "
+            "ffsubsync score {2}); the sync may be wrong.".format(
+                subtitle.name, effective, _fmt_ff_score(best["ff_score"]))
+        )
+    if dropped > 0:
+        print(
+            "[subsync] WARNING: {0} of {1} cue(s) fell before 0:00 after shifting "
+            "and were dropped.".format(dropped, orig_count)
         )
 
-    report = write_report(video, subtitle, synced, best["cues"], speech, score, label)
-    print("[subsync] report: {0} (score: {1}%)".format(report.name, score))
+    report = write_report(video, subtitle, synced, best["cues"], speech, effective,
+                          best["label"], best["ff_score"], best["ff_offset"],
+                          trustworthy, dropped, orig_count, best["overlap"],
+                          best["coverage"])
+    print("[subsync] report: {0} (score {1}%)".format(report.name, effective))
 
 
 # ---------- driver ----------
@@ -531,9 +649,9 @@ def main():
     args = [a for a in sys.argv[1:] if a not in ("-h", "--help")]
     if len(args) != len(sys.argv[1:]):
         print("usage: subtitle_sync [video ...]")
-        print("  Sync subtitle files to their video's audio using ffsubsync.")
-        print("  With no arguments, processes every video+subtitle pair in the")
-        print("  current directory.")
+        print("  Re-time subtitle files to their video's dialogue (located with")
+        print("  Whisper). With no arguments, processes every video+subtitle pair")
+        print("  in the current directory.")
         return
 
     pairs = resolve_inputs(args)
