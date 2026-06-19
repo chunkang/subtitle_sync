@@ -448,27 +448,62 @@ def write_alignment_srt(cues, path):
 def rewrite_timestamps(in_path, out_path, map_fn):
     """Re-time every cue through map_fn (seconds -> seconds), writing out_path.
 
-    Rewrites only the timestamps on each '-->' line and leaves everything else
-    (indices, cue settings, body text, blank lines, VTT header) byte-for-byte
-    intact, so the synced file is a faithful re-timing of the original rather
-    than a reserialization. Times that would go negative are clamped to 0; the
-    count of such cues is returned so the caller can warn.
+    Works block by block: each cue's '-->' timestamps are mapped while its body,
+    cue settings, and any non-cue blocks (VTT header, NOTE, STYLE) are preserved.
+    A cue shifted entirely before 0:00 (mapped end <= 0) is dropped -- emitting a
+    zero-length 00:00:00,000 --> 00:00:00,000 cue instead would stack a pile of
+    degenerate cues at the start. A cue that merely straddles 0:00 keeps its tail,
+    with the start clamped to 0. SRT indices are renumbered after any drops.
+    Returns the number of cues dropped.
     """
     ext = in_path.suffix.lower()
     arrow_re = _arrow_re_for(ext)
     parse_ts, fmt_ts = _ts_funcs_for(ext)
     text = in_path.read_text(encoding="utf-8-sig")
-    clamped = [0]
 
-    def repl(m):
+    # Split into blank-line-separated blocks (handles \n, \r\n, and \r).
+    blocks, cur = [], []
+    for line in text.splitlines():
+        if line.strip() == "":
+            if cur:
+                blocks.append(cur)
+                cur = []
+        else:
+            cur.append(line)
+    if cur:
+        blocks.append(cur)
+
+    dropped = 0
+    out_blocks = []
+    index = 1
+    for blk in blocks:
+        arrow_idx = next((k for k, ln in enumerate(blk) if arrow_re.search(ln)), None)
+        if arrow_idx is None:
+            out_blocks.append(blk)  # non-cue block (header, NOTE, STYLE, ...)
+            continue
+        m = arrow_re.search(blk[arrow_idx])
         new_start = map_fn(parse_ts(m.group(1)))
         new_end = map_fn(parse_ts(m.group(2)))
-        if new_start < 0 or new_end < 0:
-            clamped[0] += 1
-        return "{0} --> {1}".format(fmt_ts(new_start), fmt_ts(new_end))
+        if new_end <= 0:
+            dropped += 1  # cue is entirely before the start; drop it
+            continue
+        if new_start < 0:
+            new_start = 0.0
+        new_blk = list(blk)
+        new_blk[arrow_idx] = arrow_re.sub(
+            lambda _m: "{0} --> {1}".format(fmt_ts(new_start), fmt_ts(new_end)),
+            blk[arrow_idx], count=1)
+        # Renumber an SRT-style numeric index line preceding the timestamps.
+        if ext == ".srt" and arrow_idx >= 1 and new_blk[arrow_idx - 1].strip().isdigit():
+            new_blk[arrow_idx - 1] = str(index)
+        out_blocks.append(new_blk)
+        index += 1
 
-    out_path.write_text(arrow_re.sub(repl, text), encoding="utf-8")
-    return clamped[0]
+    out_text = "\n\n".join("\n".join(b) for b in out_blocks)
+    if out_text and not out_text.endswith("\n"):
+        out_text += "\n"
+    out_path.write_text(out_text, encoding="utf-8")
+    return dropped
 
 
 def apply_time_transform(in_path, out_path, scale, offset):
@@ -840,18 +875,27 @@ def clean_anchors(anchors):
 def build_time_map(anchors):
     """Piecewise-linear map subtitle_time -> audio_time from clean anchors.
 
-    Interpolates between bracketing anchors and extrapolates beyond the ends with
-    the overall slope. Returns (map_fn, global_slope).
+    Interpolates between bracketing anchors. Beyond the first/last anchor it
+    extrapolates with the *median* local slope, not the end-to-end slope: when
+    the offset jumps in steps (cut content), the end-to-end slope averages across
+    those jumps and would badly mis-time a region with no anchors -- e.g. the
+    start of a subtitle that skips its opening lines. The median local slope
+    reflects the true within-region rate (~1.0 for same-source media). Returns
+    (map_fn, global_slope) where global_slope is still the end-to-end rate, used
+    by the caller only as a plausibility check.
     """
     xs = [x for x, _ in anchors]
     ys = [y for _, y in anchors]
     gslope = (ys[-1] - ys[0]) / (xs[-1] - xs[0]) if xs[-1] > xs[0] else 1.0
+    seg_slopes = [(ys[i] - ys[i - 1]) / (xs[i] - xs[i - 1])
+                  for i in range(1, len(xs)) if xs[i] > xs[i - 1]]
+    edge_slope = statistics.median(seg_slopes) if seg_slopes else 1.0
 
     def f(t):
         if t <= xs[0]:
-            return ys[0] + (t - xs[0]) * gslope
+            return ys[0] + (t - xs[0]) * edge_slope
         if t >= xs[-1]:
-            return ys[-1] + (t - xs[-1]) * gslope
+            return ys[-1] + (t - xs[-1]) * edge_slope
         i = bisect.bisect_right(xs, t)
         x0, y0, x1, y1 = xs[i - 1], ys[i - 1], xs[i], ys[i]
         if x1 == x0:
@@ -984,7 +1028,7 @@ def write_report(video, subtitle, synced, cues, speech, score, strategy="default
     ff_offset_desc = "n/a" if ff_offset is None else "{0:.3f}s".format(ff_offset)
     cues_desc = "{0}".format(len(cues))
     if dropped > 0:
-        cues_desc += " ({0} of {1} clamped to 0:00)".format(dropped, orig_count)
+        cues_desc += " ({0} of {1} dropped before 0:00)".format(dropped, orig_count)
     lines = [
         "subtitle sync report",
         "",
@@ -1172,14 +1216,14 @@ def sync_one(video, subtitle, speech):
             scale = ff_scale if ff_scale is not None else 1.0
             # Re-apply the recovered transform to the *full* subtitle.
             candidate = tmp_dir / ("candidate" + ext)
-            clamped = apply_time_transform(subtitle, candidate, scale, ff_offset)
+            dropped = apply_time_transform(subtitle, candidate, scale, ff_offset)
             cues = parse_cues(candidate)
             dcues, _ = dialogue_cues(cues)
             overlap = compute_score(dcues, speech)
             onset = onset_score(dcues, speech)
-            # Cues clamped to 0:00 were shifted before the start; treat them as a
-            # coverage penalty so a wrong, large negative offset can't score well.
-            coverage = 1.0 - (clamped / float(orig_count) if orig_count else 0.0)
+            # Cues shifted before 0:00 are dropped; treat them as a coverage
+            # penalty so a wrong, large negative offset can't score well.
+            coverage = 1.0 - (dropped / float(orig_count) if orig_count else 0.0)
             effective = int(round(overlap * coverage))
             tier = _trust_tier(ff_score, ff_scale)
             print("[subsync]   strategy {0}: score {1}% (overlap {2}%, onset {3}%, "
@@ -1191,7 +1235,7 @@ def sync_one(video, subtitle, speech):
             cand = {"overlap": overlap, "onset": onset, "coverage": coverage,
                     "effective": effective, "cues": cues, "label": label,
                     "tier": tier, "ff_score": ff_score, "ff_offset": ff_offset,
-                    "ff_scale": scale, "clamped": clamped, "path": None}
+                    "ff_scale": scale, "dropped": dropped, "path": None}
             # Prefer an alignment we trust; break ties by effective, then onset.
             if best is None or (tier, effective, onset) > (
                     best["tier"], best["effective"], best["onset"]):
@@ -1209,7 +1253,7 @@ def sync_one(video, subtitle, speech):
         shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
     effective = best["effective"]
-    clamped = best["clamped"]
+    dropped = best["dropped"]
     trustworthy = best["tier"] == 2 and effective >= LOW_QUALITY_SCORE
     print("[subsync] wrote {0} (strategy: {1}, score {2}%, overlap {3}%, onset {4}%, "
           "scale {5:.3f}, ffsubsync score {6})".format(
@@ -1222,15 +1266,15 @@ def sync_one(video, subtitle, speech):
                 subtitle.name, effective, best["ff_scale"],
                 _fmt_ff_score(best["ff_score"]))
         )
-    if clamped > 0:
+    if dropped > 0:
         print(
             "[subsync] WARNING: {0} of {1} cue(s) shifted before 0:00 and were "
-            "clamped to the start.".format(clamped, orig_count)
+            "dropped.".format(dropped, orig_count)
         )
 
     report = write_report(video, subtitle, synced, best["cues"], speech, effective,
                           best["label"], best["ff_score"], best["ff_offset"],
-                          trustworthy, clamped, orig_count, best["overlap"],
+                          trustworthy, dropped, orig_count, best["overlap"],
                           best["coverage"])
     print("[subsync] report: {0} (score {1}%)".format(report.name, effective))
 
@@ -1241,23 +1285,23 @@ def write_content_sync(video, subtitle, result, speech, all_cues):
     synced = video.with_name(video.stem + SYNCED_TAG + ext)
     print("[subsync] syncing {0} -> {1}".format(subtitle.name, synced.name))
     orig_count = len(all_cues)
-    clamped = rewrite_timestamps(subtitle, synced, result["map"])
+    dropped = rewrite_timestamps(subtitle, synced, result["map"])
 
     overlap = result["overlap"]
     onset = result["onset"]
-    coverage = 1.0 - (clamped / float(orig_count) if orig_count else 0.0)
+    coverage = 1.0 - (dropped / float(orig_count) if orig_count else 0.0)
     score = int(round(overlap * coverage))
     label = "content ({0} anchors, slope {1:.3f}, span {2:.0f}%)".format(
         len(result["anchors"]), result["slope"], result["coverage"] * 100)
     trustworthy = score >= LOW_QUALITY_SCORE
     print("[subsync] wrote {0} (strategy: {1}, score {2}%, overlap {3}%, "
           "onset {4}%)".format(synced.name, label, score, overlap, onset))
-    if clamped > 0:
+    if dropped > 0:
         print("[subsync] WARNING: {0} of {1} cue(s) shifted before 0:00 and were "
-              "clamped to the start.".format(clamped, orig_count))
+              "dropped.".format(dropped, orig_count))
 
     report = write_report(video, subtitle, synced, parse_cues(synced), speech,
-                          score, label, None, None, trustworthy, clamped,
+                          score, label, None, None, trustworthy, dropped,
                           orig_count, overlap, coverage)
     print("[subsync] report: {0} (score {1}%)".format(report.name, score))
 
