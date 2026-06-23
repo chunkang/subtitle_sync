@@ -12,10 +12,9 @@ if [[ ! -f "$SOURCE" ]]; then
   exit 1
 fi
 
-# subtitle_sync needs a python3 interpreter (>=3.6). CentOS 7 ships only
-# python2 by default, so force-install python3 via the system package manager
-# when it is missing. Everything else (pip, ffsubsync, ffmpeg) is bootstrapped
-# by the script itself at first run.
+# subtitle_sync needs a python3 interpreter (>=3.8). Force-install python3 via
+# the system package manager when it is missing. Everything else (pip,
+# faster-whisper, ffmpeg) is bootstrapped by the script itself at first run.
 ensure_python3() {
   if command -v python3 >/dev/null 2>&1; then
     return

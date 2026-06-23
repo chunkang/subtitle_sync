@@ -2,17 +2,18 @@
 """Synchronize subtitle timing to match video audio.
 
 Given video files and their associated subtitle files (.srt or .vtt),
-uses ffsubsync to re-time the subtitles to match the audio. Writes the
-synced subtitle next to the original with a .synced suffix and a report
-file named <stem>.report.<score>.txt where score is 000-100.
+transcribes the audio with Whisper, matches the recognized text against
+subtitle cues, and bulk-shifts all timestamps by the detected offset.
+Writes the shifted subtitle next to the original with a .synced suffix
+and a report file named <stem>.report.<score>.txt where score is 000-100.
 
-Runs on Python 3.6+ so it works on older distros (e.g. CentOS 7's EPEL
-python3) as well as current ones. Missing runtime pieces (pip, ffmpeg)
-are force-installed into a per-user cache without requiring root.
+Runs on Python 3.8+.  Missing runtime pieces (pip, ffmpeg) are
+force-installed into a per-user cache without requiring root.
 
 Author: Chun Kang <kurapa@kurapa.com>
 """
 
+import difflib
 import os
 import platform
 import re
@@ -29,12 +30,12 @@ CACHE_DIR = Path.home() / ".cache" / "subtitle_sync"
 VENV_DIR = CACHE_DIR / "venv"
 FFMPEG_DIR = CACHE_DIR / "ffmpeg"
 VENV_MARKER = "SUBSYNC_IN_VENV"
-PIP_PACKAGES = ["ffsubsync"]
+PIP_PACKAGES = ["faster-whisper"]
+MIN_PYTHON = (3, 9)
 
 # Static ffmpeg builds for Linux (e.g. Amazon Linux 2023, which has no ffmpeg
-# in its default repos, and CentOS 7, whose glibc is too old for many wheels).
-# These are fully static, so they run regardless of distro/glibc and need no
-# root to install.
+# in its default repos).  Fully static, so they run regardless of distro/glibc
+# and need no root to install.
 FFMPEG_STATIC_URLS = {
     "amd64": "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
     "arm64": "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz",
@@ -59,8 +60,6 @@ def _has_pip(py):
 
 
 def _get_pip_url():
-    # PyPA keeps version-pinned installers for interpreters that current pip
-    # has dropped (CentOS 7 ships Python 3.6).
     v = sys.version_info
     if (v[0], v[1]) < (3, 7):
         return "https://bootstrap.pypa.io/pip/{0}.{1}/get-pip.py".format(v[0], v[1])
@@ -77,25 +76,62 @@ def _bootstrap_pip(py):
         subprocess.check_call([str(py), str(get_pip)])
 
 
+def _find_python():
+    candidates = ["/usr/bin/python3"]
+    for minor in range(13, 8, -1):
+        candidates.append("/usr/bin/python3.{0}".format(minor))
+        candidates.append(shutil.which("python3.{0}".format(minor)) or "")
+    candidates.append(shutil.which("python3") or "")
+    for py in candidates:
+        if not py or not os.path.isfile(py):
+            continue
+        try:
+            out = subprocess.check_output(
+                [py, "-c", "import sys; print(sys.version_info[0], sys.version_info[1])"],
+                stderr=subprocess.DEVNULL, universal_newlines=True,
+            ).strip()
+            major, minor = (int(x) for x in out.split())
+            if (major, minor) >= MIN_PYTHON:
+                return py
+        except Exception:
+            continue
+    sys.exit(
+        "error: no Python >= {0}.{1} found; faster-whisper requires it.\n"
+        "       Install a newer Python, e.g.: pyenv install 3.12".format(*MIN_PYTHON)
+    )
+
+
 def _create_venv():
-    print("[subsync] creating venv at {0}".format(VENV_DIR))
+    py = _find_python()
+    print("[subsync] creating venv at {0} (using {1})".format(VENV_DIR, py))
     VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        # Fails on minimal interpreters (e.g. CentOS 7) that lack ensurepip.
-        venv.create(VENV_DIR, with_pip=True)
-    except Exception as exc:
-        print("[subsync] ensurepip unavailable ({0}); creating venv without pip".format(exc))
-        venv.create(VENV_DIR, with_pip=False)
+    subprocess.check_call([py, "-m", "venv", str(VENV_DIR)])
     _bootstrap_pip(_venv_python())
+
+
+def _venv_python_version():
+    py = _venv_python()
+    if not py.exists():
+        return (0, 0)
+    try:
+        out = subprocess.check_output(
+            [str(py), "-c", "import sys; print(sys.version_info[0], sys.version_info[1])"],
+            stderr=subprocess.DEVNULL, universal_newlines=True,
+        ).strip()
+        return tuple(int(x) for x in out.split())
+    except Exception:
+        return (0, 0)
 
 
 def _ensure_venv_and_reexec():
     if os.environ.get(VENV_MARKER) == "1":
         return
+    if VENV_DIR.exists() and _venv_python_version() < MIN_PYTHON:
+        print("[subsync] venv Python too old; rebuilding")
+        shutil.rmtree(VENV_DIR)
     if not VENV_DIR.exists():
         _create_venv()
     venv_python = _venv_python()
-    # A pre-existing venv may predate the pip bootstrap; make sure pip is there.
     _bootstrap_pip(venv_python)
     if PIP_PACKAGES:
         missing = [p for p in PIP_PACKAGES if subprocess.run(
@@ -115,6 +151,8 @@ def _ensure_venv_and_reexec():
         env,
     )
 
+
+# ---------- ffmpeg bootstrap ----------
 
 def _cached_ffmpeg_dir():
     if (FFMPEG_DIR / "ffmpeg").exists() and (FFMPEG_DIR / "ffprobe").exists():
@@ -146,7 +184,7 @@ def _download_static_ffmpeg():
                 )
                 if member is None:
                     sys.exit("error: {0} not found in downloaded ffmpeg archive".format(name))
-                member.name = name  # flatten into FFMPEG_DIR, ignore archive subdir
+                member.name = name
                 tf.extract(member, str(FFMPEG_DIR))
                 (FFMPEG_DIR / name).chmod(0o755)
     return FFMPEG_DIR
@@ -230,47 +268,166 @@ def parse_cues(path):
     return cues
 
 
-# ---------- speech detection ----------
+# ---------- subtitle shifting ----------
 
-def _get_duration(video):
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        universal_newlines=True, check=True,
+def _format_srt_ts(seconds):
+    seconds = max(0.0, seconds)
+    total_ms = int(round(seconds * 1000))
+    h = total_ms // 3600000
+    total_ms %= 3600000
+    m = total_ms // 60000
+    total_ms %= 60000
+    s = total_ms // 1000
+    ms = total_ms % 1000
+    return "{0:02d}:{1:02d}:{2:02d},{3:03d}".format(h, m, s, ms)
+
+
+def _format_vtt_ts(seconds):
+    seconds = max(0.0, seconds)
+    total_ms = int(round(seconds * 1000))
+    h = total_ms // 3600000
+    total_ms %= 3600000
+    m = total_ms // 60000
+    total_ms %= 60000
+    s = total_ms // 1000
+    ms = total_ms % 1000
+    return "{0:02d}:{1:02d}:{2:02d}.{3:03d}".format(h, m, s, ms)
+
+
+def _shift_srt(text, offset):
+    def replace_line(match):
+        t1 = _parse_srt_ts(match.group(1)) + offset
+        t2 = _parse_srt_ts(match.group(2)) + offset
+        return "{0} --> {1}".format(_format_srt_ts(t1), _format_srt_ts(t2))
+
+    pattern = re.compile(
+        r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})"
     )
-    return float(result.stdout.strip())
+    return pattern.sub(replace_line, text)
 
 
-def detect_speech_ranges(video):
-    print("[subsync] detecting speech ranges in {0}".format(video.name))
-    result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-i", str(video),
-         "-af", "silencedetect=noise=-30dB:d=0.5",
-         "-f", "null", "-"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        universal_newlines=True,
+def _shift_vtt(text, offset):
+    def replace_line(match):
+        t1 = _parse_vtt_ts(match.group(1)) + offset
+        t2 = _parse_vtt_ts(match.group(2)) + offset
+        return "{0} --> {1}".format(_format_vtt_ts(t1), _format_vtt_ts(t2))
+
+    pattern = re.compile(
+        r"(\d{1,2}:\d{2}:\d{2}\.\d{3}|\d{2}:\d{2}\.\d{3})"
+        r"\s*-->\s*"
+        r"(\d{1,2}:\d{2}:\d{2}\.\d{3}|\d{2}:\d{2}\.\d{3})"
     )
-    silence_starts = []
-    silence_ranges = []
-    for line in result.stderr.splitlines():
-        m = re.search(r"silence_start:\s*(\S+)", line)
-        if m:
-            silence_starts.append(float(m.group(1)))
-        m = re.search(r"silence_end:\s*(\S+)", line)
-        if m and silence_starts:
-            silence_ranges.append((silence_starts.pop(0), float(m.group(1))))
+    return pattern.sub(replace_line, text)
 
-    duration = _get_duration(video)
-    speech = []
-    prev = 0.0
-    for ss, se in sorted(silence_ranges):
-        if ss > prev:
-            speech.append((prev, ss))
-        prev = se
-    if prev < duration:
-        speech.append((prev, duration))
-    return speech
+
+def shift_subtitle(subtitle, synced, offset):
+    text = subtitle.read_text(encoding="utf-8")
+    ext = subtitle.suffix.lower()
+    if ext == ".srt":
+        shifted = _shift_srt(text, offset)
+    else:
+        shifted = _shift_vtt(text, offset)
+    synced.write_text(shifted, encoding="utf-8")
+
+
+# ---------- language detection ----------
+
+# Unicode block ranges for CJK and Hangul characters.
+_CJK_RANGES = [
+    (0x4E00, 0x9FFF),    # CJK Unified Ideographs
+    (0x3400, 0x4DBF),    # CJK Extension A
+    (0x3000, 0x303F),    # CJK Symbols and Punctuation
+    (0xFF00, 0xFFEF),    # Fullwidth Forms
+]
+_HANGUL_RANGES = [
+    (0xAC00, 0xD7AF),    # Hangul Syllables
+    (0x1100, 0x11FF),    # Hangul Jamo
+    (0x3130, 0x318F),    # Hangul Compatibility Jamo
+]
+_KANA_RANGES = [
+    (0x3040, 0x309F),    # Hiragana
+    (0x30A0, 0x30FF),    # Katakana
+]
+
+
+def _in_ranges(ch, ranges):
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in ranges)
+
+
+def detect_language(cues):
+    sample = " ".join(text for _, _, text in cues[:50])
+    counts = {"ko": 0, "ja": 0, "zh": 0}
+    total = 0
+    for ch in sample:
+        if ch.isspace():
+            continue
+        total += 1
+        if _in_ranges(ch, _HANGUL_RANGES):
+            counts["ko"] += 1
+        elif _in_ranges(ch, _KANA_RANGES):
+            counts["ja"] += 1
+        elif _in_ranges(ch, _CJK_RANGES):
+            counts["zh"] += 1
+    if total == 0:
+        return "en"
+    if counts["ko"] > total * 0.3:
+        return "ko"
+    if counts["ja"] > total * 0.1:
+        return "ja"
+    if counts["zh"] > total * 0.3:
+        return "zh"
+    return "en"
+
+
+# ---------- whisper transcription ----------
+
+def transcribe_audio(video, language):
+    from faster_whisper import WhisperModel
+
+    print("[subsync] transcribing {0} with whisper (medium, language={1})...".format(
+        video.name, language))
+    model = WhisperModel("medium", compute_type="int8")
+    segments, _info = model.transcribe(str(video), language=language)
+    result = []
+    for seg in segments:
+        result.append((seg.start, seg.end, seg.text.strip()))
+    return result
+
+
+# ---------- text matching ----------
+
+def _normalize(text):
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def find_offset(whisper_segments, cues):
+    best_ratio = 0.0
+    best_offset = 0.0
+    best_w = ""
+    best_c = ""
+
+    for ws, _we, wtext in whisper_segments:
+        wn = _normalize(wtext)
+        if not wn:
+            continue
+        for cs, _ce, ctext in cues:
+            cn = _normalize(ctext)
+            if not cn:
+                continue
+            ratio = difflib.SequenceMatcher(None, wn, cn).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_offset = ws - cs
+                best_w = wtext
+                best_c = ctext
+
+    if best_ratio < 0.4:
+        return None, best_ratio, "", ""
+    return best_offset, best_ratio, best_w, best_c
 
 
 # ---------- scoring & report ----------
@@ -312,18 +469,24 @@ def _clean_old_reports(video):
             f.unlink()
 
 
-def write_report(video, subtitle, synced, cues, speech, score):
+def write_report(video, subtitle, synced, cues, speech, score, offset,
+                 match_confidence, match_whisper, match_cue):
     _clean_old_reports(video)
     report = video.with_name("{0}.report.{1:03d}.txt".format(video.stem, score))
 
     lines = [
         "subtitle sync report",
         "",
-        "video:    {0}".format(video.name),
-        "subtitle: {0}".format(subtitle.name),
-        "synced:   {0}".format(synced.name),
-        "score:    {0}%".format(score),
-        "cues:     {0}".format(len(cues)),
+        "video:      {0}".format(video.name),
+        "subtitle:   {0}".format(subtitle.name),
+        "synced:     {0}".format(synced.name),
+        "score:      {0}%".format(score),
+        "cues:       {0}".format(len(cues)),
+        "offset:     {0:+.3f}s".format(offset),
+        "confidence: {0:.0%}".format(match_confidence),
+        "",
+        "matched whisper: {0}".format(match_whisper),
+        "matched cue:     {0}".format(match_cue),
         "",
     ]
     for i, (start, end, text) in enumerate(cues, 1):
@@ -395,20 +558,40 @@ def resolve_inputs(args):
 
 # ---------- sync ----------
 
-def sync_one(video, subtitle, speech):
+def sync_one(video, subtitle):
+    cues = parse_cues(subtitle)
+    if not cues:
+        print("[subsync] no cues found in {0}; skipping".format(subtitle.name))
+        return
+
+    language = detect_language(cues)
+    print("[subsync] detected subtitle language: {0}".format(language))
+    whisper_segments = transcribe_audio(video, language)
+    if not whisper_segments:
+        print("[subsync] no speech recognized in {0}; skipping".format(video.name))
+        return
+
+    offset, confidence, match_w, match_c = find_offset(whisper_segments, cues)
+    if offset is None:
+        print("[subsync] no text match found (best similarity: {0:.0%}); skipping".format(
+            confidence))
+        return
+
     ext = subtitle.suffix
     synced = video.with_name(video.stem + SYNCED_TAG + ext)
-    print("[subsync] syncing {0} -> {1}".format(subtitle.name, synced.name))
-    subprocess.run(
-        [sys.executable, "-m", "ffsubsync",
-         str(video), "-i", str(subtitle), "-o", str(synced)],
-        check=True,
-    )
+    print("[subsync] match confidence: {0:.0%}, offset: {1:+.3f}s".format(confidence, offset))
+    print("[subsync]   whisper: {0}".format(match_w))
+    print("[subsync]   cue:     {0}".format(match_c))
+    print("[subsync] shifting {0} -> {1}".format(subtitle.name, synced.name))
+
+    shift_subtitle(subtitle, synced, offset)
     print("[subsync] wrote {0}".format(synced.name))
 
-    cues = parse_cues(synced)
-    score = compute_score(cues, speech)
-    report = write_report(video, subtitle, synced, cues, speech, score)
+    speech = [(s, e) for s, e, _ in whisper_segments]
+    synced_cues = parse_cues(synced)
+    score = compute_score(synced_cues, speech)
+    report = write_report(video, subtitle, synced, synced_cues, speech, score,
+                          offset, confidence, match_w, match_c)
     print("[subsync] report: {0} (score: {1}%)".format(report.name, score))
 
 
@@ -418,9 +601,10 @@ def main():
     args = [a for a in sys.argv[1:] if a not in ("-h", "--help")]
     if len(args) != len(sys.argv[1:]):
         print("usage: subtitle_sync [video ...]")
-        print("  Sync subtitle files to their video's audio using ffsubsync.")
-        print("  With no arguments, processes every video+subtitle pair in the")
-        print("  current directory.")
+        print("  Transcribe video audio with Whisper, match against subtitle")
+        print("  text, and bulk-shift timestamps by the detected offset.")
+        print("  With no arguments, processes every video+subtitle pair in")
+        print("  the current directory.")
         return
 
     pairs = resolve_inputs(args)
@@ -430,8 +614,7 @@ def main():
     print()
 
     for video, sub in pairs:
-        speech = detect_speech_ranges(video)
-        sync_one(video, sub, speech)
+        sync_one(video, sub)
 
 
 if __name__ == "__main__":
