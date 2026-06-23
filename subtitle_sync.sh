@@ -382,16 +382,32 @@ def detect_language(cues):
 
 # ---------- whisper transcription ----------
 
+def _get_duration(video):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True, check=True,
+    )
+    return float(result.stdout.strip())
+
+
 def transcribe_audio(video, language):
     from faster_whisper import WhisperModel
 
-    print("[subsync] transcribing {0} with whisper (medium, language={1})...".format(
-        video.name, language))
+    duration = _get_duration(video)
+    print("[subsync] transcribing {0} ({1}) with whisper (medium, language={2})...".format(
+        video.name, _fmt_ts(duration), language))
     model = WhisperModel("medium", compute_type="int8")
     segments, _info = model.transcribe(str(video), language=language)
     result = []
     for seg in segments:
         result.append((seg.start, seg.end, seg.text.strip()))
+        pct = min(100, int(seg.end / duration * 100)) if duration > 0 else 0
+        sys.stderr.write("\r[subsync] progress: {0}% ({1} / {2})".format(
+            pct, _fmt_ts(seg.end), _fmt_ts(duration)))
+    sys.stderr.write("\n")
+    print("[subsync] transcribed {0} segment(s)".format(len(result)))
     return result
 
 
