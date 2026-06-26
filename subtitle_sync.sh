@@ -415,29 +415,42 @@ def _normalize(text):
 
 
 def find_offset(whisper_segments, cues):
-    best_ratio = 0.0
-    best_offset = 0.0
-    best_w = ""
-    best_c = ""
+    MIN_RATIO = 0.4
 
-    for ws, _we, wtext in whisper_segments:
+    candidates = []
+    best_below = 0.0
+    for wi, (ws, _we, wtext) in enumerate(whisper_segments):
         wn = _normalize(wtext)
         if not wn:
             continue
-        for cs, _ce, ctext in cues:
+        for ci, (cs, _ce, ctext) in enumerate(cues):
             cn = _normalize(ctext)
             if not cn:
                 continue
             ratio = difflib.SequenceMatcher(None, wn, cn).ratio()
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_offset = ws - cs
-                best_w = wtext
-                best_c = ctext
+            if ratio >= MIN_RATIO:
+                candidates.append((ratio, wi, ci, ws - cs, wtext, ctext))
+            elif ratio > best_below:
+                best_below = ratio
 
-    if best_ratio < 0.4:
-        return None, best_ratio, "", ""
-    return best_offset, best_ratio, best_w, best_c
+    if not candidates:
+        return None, best_below, []
+
+    candidates.sort(reverse=True)
+    used_w = set()
+    used_c = set()
+    samples = []
+    for ratio, wi, ci, off, wtext, ctext in candidates:
+        if wi in used_w or ci in used_c:
+            continue
+        used_w.add(wi)
+        used_c.add(ci)
+        samples.append((off, ratio, wtext, ctext))
+
+    offsets = sorted(s[0] for s in samples)
+    median_offset = offsets[len(offsets) // 2]
+
+    return median_offset, samples[0][1], samples
 
 
 # ---------- scoring & report ----------
@@ -479,10 +492,12 @@ def _clean_old_reports(video):
             f.unlink()
 
 
-def write_report(video, subtitle, synced, cues, speech, score, offset,
-                 match_confidence, match_whisper, match_cue):
+def write_report(video, subtitle, synced, cues, speech, score, offset, samples):
     _clean_old_reports(video)
     report = video.with_name("{0}.report.{1:03d}.txt".format(video.stem, score))
+
+    sample_offsets = [s[0] for s in samples]
+    spread = max(sample_offsets) - min(sample_offsets) if len(samples) > 1 else 0.0
 
     lines = [
         "subtitle sync report",
@@ -492,13 +507,16 @@ def write_report(video, subtitle, synced, cues, speech, score, offset,
         "synced:     {0}".format(synced.name),
         "score:      {0}%".format(score),
         "cues:       {0}".format(len(cues)),
-        "offset:     {0:+.3f}s".format(offset),
-        "confidence: {0:.0%}".format(match_confidence),
+        "offset:     {0:+.3f}s (median of {1} sample(s), spread {2:.3f}s)".format(
+            offset, len(samples), spread),
         "",
-        "matched whisper: {0}".format(match_whisper),
-        "matched cue:     {0}".format(match_cue),
-        "",
+        "offset samples:",
     ]
+    for i, (off, ratio, wtext, ctext) in enumerate(samples, 1):
+        lines.append("  #{0}  offset: {1:+.3f}s  confidence: {2:.0%}".format(i, off, ratio))
+        lines.append("      whisper: {0}".format(wtext))
+        lines.append("      cue:     {0}".format(ctext))
+    lines.append("")
     for i, (start, end, text) in enumerate(cues, 1):
         hit = _cue_hits_speech(start, end, speech)
         marker = "+" if hit else "-"
@@ -596,7 +614,7 @@ def sync_one(video, subtitle, debug=False):
     if debug:
         _write_whisper_srt(video, whisper_segments)
 
-    offset, confidence, match_w, match_c = find_offset(whisper_segments, cues)
+    offset, confidence, samples = find_offset(whisper_segments, cues)
     if offset is None:
         print("[subsync] no text match found (best similarity: {0:.0%}); skipping".format(
             confidence))
@@ -604,9 +622,12 @@ def sync_one(video, subtitle, debug=False):
 
     ext = subtitle.suffix
     synced = video.with_name(video.stem + SYNCED_TAG + ext)
-    print("[subsync] match confidence: {0:.0%}, offset: {1:+.3f}s".format(confidence, offset))
-    print("[subsync]   whisper: {0}".format(match_w))
-    print("[subsync]   cue:     {0}".format(match_c))
+    print("[subsync] {0} sample(s), median offset: {1:+.3f}s".format(len(samples), offset))
+    for off, ratio, wtext, ctext in samples[:5]:
+        print("[subsync]   [{0:.0%} {1:+.3f}s] {2}".format(ratio, off, wtext[:60]))
+        print("[subsync]              <-> {0}".format(ctext[:60]))
+    if len(samples) > 5:
+        print("[subsync]   ... and {0} more (see report)".format(len(samples) - 5))
     print("[subsync] shifting {0} -> {1}".format(subtitle.name, synced.name))
 
     shift_subtitle(subtitle, synced, offset)
@@ -616,7 +637,7 @@ def sync_one(video, subtitle, debug=False):
     synced_cues = parse_cues(synced)
     score = compute_score(synced_cues, speech)
     report = write_report(video, subtitle, synced, synced_cues, speech, score,
-                          offset, confidence, match_w, match_c)
+                          offset, samples)
     print("[subsync] report: {0} (score: {1}%)".format(report.name, score))
 
 
