@@ -416,6 +416,8 @@ def _normalize(text):
 
 def find_offset(whisper_segments, cues):
     MIN_RATIO = 0.4
+    MIN_SAMPLES = 10
+    MAX_SAMPLES = 30
 
     candidates = []
     best_below = 0.0
@@ -446,6 +448,11 @@ def find_offset(whisper_segments, cues):
         used_w.add(wi)
         used_c.add(ci)
         samples.append((off, ratio, wtext, ctext))
+        if len(samples) >= MAX_SAMPLES:
+            break
+
+    if len(samples) < MIN_SAMPLES:
+        return None, samples[0][1] if samples else best_below, samples
 
     offsets = sorted(s[0] for s in samples)
     median_offset = offsets[len(offsets) // 2]
@@ -616,8 +623,15 @@ def sync_one(video, subtitle, debug=False):
 
     offset, confidence, samples = find_offset(whisper_segments, cues)
     if offset is None:
-        print("[subsync] no text match found (best similarity: {0:.0%}); skipping".format(
-            confidence))
+        if samples:
+            print("[subsync] only {0} text match(es) found (need 10); skipping".format(
+                len(samples)))
+            for off, ratio, wtext, ctext in samples:
+                print("[subsync]   [{0:.0%} {1:+.3f}s] {2}".format(ratio, off, wtext[:60]))
+                print("[subsync]              <-> {0}".format(ctext[:60]))
+        else:
+            print("[subsync] no text match found (best similarity: {0:.0%}); skipping".format(
+                confidence))
         return
 
     ext = subtitle.suffix
