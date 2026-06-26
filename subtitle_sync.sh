@@ -415,7 +415,8 @@ def transcribe_audio(video, language):
 
 def _normalize(text):
     text = text.lower()
-    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'[^\w\s]', '', text, flags=re.UNICODE)
+    text = re.sub(r'[\d_]', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -574,7 +575,19 @@ def resolve_inputs(args):
 
 # ---------- sync ----------
 
-def sync_one(video, subtitle):
+def _write_whisper_srt(video, segments):
+    path = video.with_name(video.stem + ".whisper.srt")
+    lines = []
+    for i, (start, end, text) in enumerate(segments, 1):
+        lines.append(str(i))
+        lines.append("{0} --> {1}".format(_format_srt_ts(start), _format_srt_ts(end)))
+        lines.append(text)
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    print("[subsync] wrote whisper transcript: {0}".format(path.name))
+
+
+def sync_one(video, subtitle, debug=False):
     cues = parse_cues(subtitle)
     if not cues:
         print("[subsync] no cues found in {0}; skipping".format(subtitle.name))
@@ -586,6 +599,9 @@ def sync_one(video, subtitle):
     if not whisper_segments:
         print("[subsync] no speech recognized in {0}; skipping".format(video.name))
         return
+
+    if debug:
+        _write_whisper_srt(video, whisper_segments)
 
     offset, confidence, match_w, match_c = find_offset(whisper_segments, cues)
     if offset is None:
@@ -614,13 +630,15 @@ def sync_one(video, subtitle):
 # ---------- driver ----------
 
 def main():
-    args = [a for a in sys.argv[1:] if a not in ("-h", "--help")]
-    if len(args) != len(sys.argv[1:]):
-        print("usage: subtitle_sync [video ...]")
+    debug = "-d" in sys.argv[1:]
+    args = [a for a in sys.argv[1:] if a not in ("-h", "--help", "-d")]
+    if "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
+        print("usage: subtitle_sync [-d] [video ...]")
         print("  Transcribe video audio with Whisper, match against subtitle")
         print("  text, and bulk-shift timestamps by the detected offset.")
         print("  With no arguments, processes every video+subtitle pair in")
         print("  the current directory.")
+        print("  -d  save whisper transcript as <video>.whisper.srt")
         return
 
     pairs = resolve_inputs(args)
@@ -630,7 +648,7 @@ def main():
     print()
 
     for video, sub in pairs:
-        sync_one(video, sub)
+        sync_one(video, sub, debug=debug)
 
 
 if __name__ == "__main__":
