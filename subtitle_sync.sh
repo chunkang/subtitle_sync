@@ -294,40 +294,33 @@ def _format_vtt_ts(seconds):
     return "{0:02d}:{1:02d}:{2:02d}.{3:03d}".format(h, m, s, ms)
 
 
-def _shift_srt(text, offset):
-    def replace_line(match):
-        t1 = _parse_srt_ts(match.group(1)) + offset
-        t2 = _parse_srt_ts(match.group(2)) + offset
-        return "{0} --> {1}".format(_format_srt_ts(t1), _format_srt_ts(t2))
-
-    pattern = re.compile(
-        r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})"
-    )
-    return pattern.sub(replace_line, text)
-
-
-def _shift_vtt(text, offset):
-    def replace_line(match):
-        t1 = _parse_vtt_ts(match.group(1)) + offset
-        t2 = _parse_vtt_ts(match.group(2)) + offset
-        return "{0} --> {1}".format(_format_vtt_ts(t1), _format_vtt_ts(t2))
-
-    pattern = re.compile(
-        r"(\d{1,2}:\d{2}:\d{2}\.\d{3}|\d{2}:\d{2}\.\d{3})"
-        r"\s*-->\s*"
-        r"(\d{1,2}:\d{2}:\d{2}\.\d{3}|\d{2}:\d{2}\.\d{3})"
-    )
-    return pattern.sub(replace_line, text)
-
-
 def shift_subtitle(subtitle, synced, offset):
-    text = subtitle.read_text(encoding="utf-8")
+    cues = parse_cues(subtitle)
     ext = subtitle.suffix.lower()
+
+    shifted = []
+    for start, end, text in cues:
+        new_end = end + offset
+        if new_end <= 0:
+            continue
+        new_start = max(0.0, start + offset)
+        shifted.append((new_start, max(new_start, new_end), text))
+
     if ext == ".srt":
-        shifted = _shift_srt(text, offset)
+        lines = []
+        for i, (start, end, text) in enumerate(shifted, 1):
+            lines.append(str(i))
+            lines.append("{0} --> {1}".format(_format_srt_ts(start), _format_srt_ts(end)))
+            lines.append(text)
+            lines.append("")
+        synced.write_text("\n".join(lines), encoding="utf-8")
     else:
-        shifted = _shift_vtt(text, offset)
-    synced.write_text(shifted, encoding="utf-8")
+        lines = ["WEBVTT", ""]
+        for start, end, text in shifted:
+            lines.append("{0} --> {1}".format(_format_vtt_ts(start), _format_vtt_ts(end)))
+            lines.append(text)
+            lines.append("")
+        synced.write_text("\n".join(lines), encoding="utf-8")
 
 
 # ---------- language detection ----------
