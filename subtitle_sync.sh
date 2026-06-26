@@ -391,7 +391,8 @@ def transcribe_audio(video, language):
     duration = _get_duration(video)
     print("[subsync] transcribing {0} ({1}) with whisper (medium, language={2})...".format(
         video.name, _fmt_ts(duration), language))
-    model = WhisperModel("medium", compute_type="int8")
+    compute_type = "int8" if sys.platform == "darwin" else "auto"
+    model = WhisperModel("medium", compute_type=compute_type)
     segments, _info = model.transcribe(str(video), language=language)
     result = []
     for seg in segments:
