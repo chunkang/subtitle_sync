@@ -9,6 +9,8 @@ venv/
 *.synced.srt
 *.synced.vtt
 *.report.[0-9][0-9][0-9].txt
+*.report_full.[0-9][0-9][0-9].txt
+*.report_partial.[0-9][0-9][0-9].txt
 
 # OS / editor
 .DS_Store
