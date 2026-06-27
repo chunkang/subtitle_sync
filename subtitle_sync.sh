@@ -3,7 +3,12 @@
 
 Given video files and their associated subtitle files (.srt or .vtt),
 transcribes the audio with Whisper, matches the recognized text against
-subtitle cues, and bulk-shifts all timestamps by the detected offset.
+subtitle cues, and shifts timestamps by the detected offset.
+
+Two modes:
+  full    - single median offset applied to all cues
+  partial - per-section offset interpolated between anchor points (default)
+
 Writes the shifted subtitle next to the original with a .synced suffix
 and a report file named <stem>.report.<score>.txt where score is 000-100.
 
@@ -294,16 +299,35 @@ def _format_vtt_ts(seconds):
     return "{0:02d}:{1:02d}:{2:02d}.{3:03d}".format(h, m, s, ms)
 
 
-def shift_subtitle(subtitle, synced, offset):
+def _interpolate_offset(cue_start, anchors):
+    if len(anchors) == 1:
+        return anchors[0][1]
+    if cue_start <= anchors[0][0]:
+        return anchors[0][1]
+    if cue_start >= anchors[-1][0]:
+        return anchors[-1][1]
+    for i in range(len(anchors) - 1):
+        t0, o0 = anchors[i]
+        t1, o1 = anchors[i + 1]
+        if cue_start <= t1:
+            if t1 == t0:
+                return o0
+            frac = (cue_start - t0) / (t1 - t0)
+            return o0 + frac * (o1 - o0)
+    return anchors[-1][1]
+
+
+def shift_subtitle(subtitle, synced, offset, anchors=None):
     cues = parse_cues(subtitle)
     ext = subtitle.suffix.lower()
 
     shifted = []
     for start, end, text in cues:
-        new_end = end + offset
+        off = _interpolate_offset(start, anchors) if anchors else offset
+        new_end = end + off
         if new_end <= 0:
             continue
-        new_start = max(0.0, start + offset)
+        new_start = max(0.0, start + off)
         shifted.append((new_start, max(new_start, new_end), text))
 
     if ext == ".srt":
@@ -415,10 +439,8 @@ def _normalize(text):
     return text
 
 
-def find_offset(whisper_segments, cues):
+def _find_matches(whisper_segments, cues, max_samples=30):
     MIN_RATIO = 0.4
-    MIN_SAMPLES = 10
-    MAX_SAMPLES = 30
 
     candidates = []
     best_below = 0.0
@@ -432,25 +454,35 @@ def find_offset(whisper_segments, cues):
                 continue
             ratio = difflib.SequenceMatcher(None, wn, cn).ratio()
             if ratio >= MIN_RATIO:
-                candidates.append((ratio, wi, ci, ws - cs, wtext, ctext))
+                candidates.append((ratio, wi, ci, ws - cs, wtext, ctext, cs))
             elif ratio > best_below:
                 best_below = ratio
 
     if not candidates:
-        return None, best_below, []
+        return best_below, []
 
     candidates.sort(reverse=True)
     used_w = set()
     used_c = set()
     samples = []
-    for ratio, wi, ci, off, wtext, ctext in candidates:
+    for ratio, wi, ci, off, wtext, ctext, cs in candidates:
         if wi in used_w or ci in used_c:
             continue
         used_w.add(wi)
         used_c.add(ci)
-        samples.append((off, ratio, wtext, ctext))
-        if len(samples) >= MAX_SAMPLES:
+        samples.append((off, ratio, wtext, ctext, cs))
+        if max_samples and len(samples) >= max_samples:
             break
+
+    return best_below, samples
+
+
+def find_offset(whisper_segments, cues):
+    MIN_SAMPLES = 10
+    best_below, samples = _find_matches(whisper_segments, cues, max_samples=30)
+
+    if not samples:
+        return None, best_below, []
 
     if len(samples) < MIN_SAMPLES:
         return None, samples[0][1] if samples else best_below, samples
@@ -459,6 +491,20 @@ def find_offset(whisper_segments, cues):
     median_offset = offsets[len(offsets) // 2]
 
     return median_offset, samples[0][1], samples
+
+
+def find_anchors(whisper_segments, cues):
+    MIN_SAMPLES = 3
+    best_below, samples = _find_matches(whisper_segments, cues, max_samples=0)
+
+    if not samples:
+        return None, best_below, []
+
+    if len(samples) < MIN_SAMPLES:
+        return None, samples[0][1] if samples else best_below, samples
+
+    anchors = sorted([(cs, off) for off, _ratio, _wt, _ct, cs in samples])
+    return anchors, samples[0][1], samples
 
 
 # ---------- scoring & report ----------
@@ -500,7 +546,8 @@ def _clean_old_reports(video):
             f.unlink()
 
 
-def write_report(video, subtitle, synced, cues, speech, score, offset, samples):
+def write_report(video, subtitle, synced, cues, speech, score, offset, samples,
+                 mode="full", anchors=None):
     _clean_old_reports(video)
     report = video.with_name("{0}.report.{1:03d}.txt".format(video.stem, score))
 
@@ -515,15 +562,28 @@ def write_report(video, subtitle, synced, cues, speech, score, offset, samples):
         "synced:     {0}".format(synced.name),
         "score:      {0}%".format(score),
         "cues:       {0}".format(len(cues)),
-        "offset:     {0:+.3f}s (median of {1} sample(s), spread {2:.3f}s)".format(
-            offset, len(samples), spread),
-        "",
-        "offset samples:",
+        "mode:       {0}".format(mode),
     ]
-    for i, (off, ratio, wtext, ctext) in enumerate(samples, 1):
+    if mode == "partial" and anchors:
+        anchor_offsets = [o for _, o in anchors]
+        lines.append("anchors:    {0} (offset range: {1:+.3f}s to {2:+.3f}s, spread {3:.3f}s)".format(
+            len(anchors), min(anchor_offsets), max(anchor_offsets), spread))
+    else:
+        lines.append("offset:     {0:+.3f}s (median of {1} sample(s), spread {2:.3f}s)".format(
+            offset, len(samples), spread))
+    lines += [
+        "",
+        "offset samples (by confidence):",
+    ]
+    for i, (off, ratio, wtext, ctext, _cs) in enumerate(samples, 1):
         lines.append("  #{0}  offset: {1:+.3f}s  confidence: {2:.0%}".format(i, off, ratio))
         lines.append("      whisper: {0}".format(wtext))
         lines.append("      cue:     {0}".format(ctext))
+    if mode == "partial" and anchors:
+        lines.append("")
+        lines.append("anchor points (chronological):")
+        for i, (cs, off) in enumerate(anchors, 1):
+            lines.append("  #{0}  @ {1}  offset: {2:+.3f}s".format(i, _fmt_ts(cs), off))
     lines.append("")
     for i, (start, end, text) in enumerate(cues, 1):
         hit = _cue_hits_speech(start, end, speech)
@@ -606,7 +666,7 @@ def _write_whisper_srt(video, segments):
     print("[subsync] wrote whisper transcript: {0}".format(path.name))
 
 
-def sync_one(video, subtitle, debug=False):
+def sync_one(video, subtitle, mode="full", debug=False):
     cues = parse_cues(subtitle)
     if not cues:
         print("[subsync] no cues found in {0}; skipping".format(subtitle.name))
@@ -622,12 +682,18 @@ def sync_one(video, subtitle, debug=False):
     if debug:
         _write_whisper_srt(video, whisper_segments)
 
-    offset, confidence, samples = find_offset(whisper_segments, cues)
-    if offset is None:
+    if mode == "partial":
+        result, confidence, samples = find_anchors(whisper_segments, cues)
+        min_needed = 3
+    else:
+        result, confidence, samples = find_offset(whisper_segments, cues)
+        min_needed = 10
+
+    if result is None:
         if samples:
-            print("[subsync] only {0} text match(es) found (need 10); skipping".format(
-                len(samples)))
-            for off, ratio, wtext, ctext in samples:
+            print("[subsync] only {0} text match(es) found (need {1}); skipping".format(
+                len(samples), min_needed))
+            for off, ratio, wtext, ctext, _cs in samples:
                 print("[subsync]   [{0:.0%} {1:+.3f}s] {2}".format(ratio, off, wtext[:60]))
                 print("[subsync]              <-> {0}".format(ctext[:60]))
         else:
@@ -637,47 +703,75 @@ def sync_one(video, subtitle, debug=False):
 
     ext = subtitle.suffix
     synced = video.with_name(video.stem + SYNCED_TAG + ext)
-    print("[subsync] {0} sample(s), median offset: {1:+.3f}s".format(len(samples), offset))
-    for off, ratio, wtext, ctext in samples[:5]:
+    anchors = None
+    offset = None
+
+    if mode == "partial":
+        anchors = result
+        anchor_offsets = [o for _, o in anchors]
+        print("[subsync] {0} anchor(s), offset range: {1:+.3f}s to {2:+.3f}s".format(
+            len(anchors), min(anchor_offsets), max(anchor_offsets)))
+    else:
+        offset = result
+        print("[subsync] {0} sample(s), median offset: {1:+.3f}s".format(len(samples), offset))
+
+    for off, ratio, wtext, ctext, _cs in samples[:5]:
         print("[subsync]   [{0:.0%} {1:+.3f}s] {2}".format(ratio, off, wtext[:60]))
         print("[subsync]              <-> {0}".format(ctext[:60]))
     if len(samples) > 5:
         print("[subsync]   ... and {0} more (see report)".format(len(samples) - 5))
     print("[subsync] shifting {0} -> {1}".format(subtitle.name, synced.name))
 
-    shift_subtitle(subtitle, synced, offset)
+    shift_subtitle(subtitle, synced, offset, anchors=anchors)
     print("[subsync] wrote {0}".format(synced.name))
 
     speech = [(s, e) for s, e, _ in whisper_segments]
     synced_cues = parse_cues(synced)
     score = compute_score(synced_cues, speech)
     report = write_report(video, subtitle, synced, synced_cues, speech, score,
-                          offset, samples)
+                          offset, samples, mode=mode, anchors=anchors)
     print("[subsync] report: {0} (score: {1}%)".format(report.name, score))
 
 
 # ---------- driver ----------
 
+_MODE_FLAGS = {
+    "-full": "full", "-full_bulk_shift": "full",
+    "-partial": "partial", "-partial_bulk_shift": "partial",
+}
+_ALL_FLAGS = set(list(_MODE_FLAGS) + ["-h", "--help", "-d"])
+
+
 def main():
     debug = "-d" in sys.argv[1:]
-    args = [a for a in sys.argv[1:] if a not in ("-h", "--help", "-d")]
+    mode = "partial"
+    for arg in sys.argv[1:]:
+        if arg in _MODE_FLAGS:
+            mode = _MODE_FLAGS[arg]
+    args = [a for a in sys.argv[1:] if a not in _ALL_FLAGS]
     if "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
-        print("usage: subtitle_sync [-d] [video ...]")
+        print("usage: subtitle_sync [-d] [-full | -partial] [video ...]")
         print("  Transcribe video audio with Whisper, match against subtitle")
-        print("  text, and bulk-shift timestamps by the detected offset.")
+        print("  text, and shift timestamps by the detected offset.")
         print("  With no arguments, processes every video+subtitle pair in")
         print("  the current directory.")
-        print("  -d  save whisper transcript as <video>.whisper.srt")
+        print("")
+        print("  modes:")
+        print("    -full, -full_bulk_shift       uniform offset for all cues")
+        print("    -partial, -partial_bulk_shift  per-section offset via anchor interpolation (default)")
+        print("")
+        print("  options:")
+        print("    -d  save whisper transcript as <video>.whisper.srt")
         return
 
     pairs = resolve_inputs(args)
-    print("[subsync] {0} pair(s) to sync:".format(len(pairs)))
+    print("[subsync] {0} pair(s) to sync ({1} mode):".format(len(pairs), mode))
     for video, sub in pairs:
         print("        {0} + {1}".format(video.name, sub.name))
     print()
 
     for video, sub in pairs:
-        sync_one(video, sub, debug=debug)
+        sync_one(video, sub, mode=mode, debug=debug)
 
 
 if __name__ == "__main__":
