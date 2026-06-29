@@ -3,10 +3,11 @@
 
 Given video files and their associated subtitle files (.srt or .vtt),
 transcribes the audio with Whisper, matches the recognized text against
-subtitle cues, and shifts timestamps in two steps:
+subtitle cues, and shifts timestamps in one of two modes:
 
-  1. Full bulk shift  - single median offset applied to all cues
-  2. Partial sync     - per-section offset interpolated between anchor points
+  -full     (default) single median offset applied to all cues
+  -partial  full bulk shift, then a per-section offset interpolated
+            between anchor points applied on top of the result
 
 Writes the shifted subtitle next to the original with a .synced suffix
 and report files named <stem>.report_full.<score>.txt and
@@ -672,7 +673,7 @@ def _write_whisper_srt(video, segments):
     print("[subsync] wrote whisper transcript: {0}".format(path.name))
 
 
-def sync_one(video, subtitle, debug=False):
+def sync_one(video, subtitle, mode="full", save_transcript=True):
     cues = parse_cues(subtitle)
     if not cues:
         print("[subsync] no cues found in {0}; skipping".format(subtitle.name))
@@ -685,7 +686,7 @@ def sync_one(video, subtitle, debug=False):
         print("[subsync] no speech recognized in {0}; skipping".format(video.name))
         return
 
-    if debug:
+    if save_transcript:
         _write_whisper_srt(video, whisper_segments)
 
     _clean_old_reports(video)
@@ -693,8 +694,8 @@ def sync_one(video, subtitle, debug=False):
     ext = subtitle.suffix
     synced = video.with_name(video.stem + SYNCED_TAG + ext)
 
-    # --- step 1: full bulk shift ---
-    print("[subsync] step 1: full bulk shift")
+    # --- full bulk shift ---
+    print("[subsync] full bulk shift")
     offset, confidence, full_samples = find_offset(whisper_segments, cues)
     if offset is None:
         if full_samples:
@@ -724,8 +725,12 @@ def sync_one(video, subtitle, debug=False):
                                mode="full", report_type="full")
     print("[subsync] full: {0} (score: {1}%)".format(full_report.name, full_score))
 
-    # --- step 2: partial sync on the full-synced result ---
-    print("[subsync] step 2: partial sync")
+    if mode != "partial":
+        print("[subsync] wrote {0}".format(synced.name))
+        return
+
+    # --- partial correction on the full-synced result ---
+    print("[subsync] partial correction")
     anchors, confidence, partial_samples = find_anchors(whisper_segments, synced_cues)
     if anchors is None:
         if partial_samples:
@@ -759,29 +764,38 @@ def sync_one(video, subtitle, debug=False):
 # ---------- driver ----------
 
 def main():
-    debug = "-d" in sys.argv[1:]
-    args = [a for a in sys.argv[1:] if a not in ("-h", "--help", "-d")]
-    if "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
-        print("usage: subtitle_sync [-d] [video ...]")
+    argv = sys.argv[1:]
+    if any(a in ("-h", "-help", "--help") for a in argv):
+        print("usage: subtitle_sync [-full|--full | -partial|--partial] [--no-transcript] [video ...]")
         print("  Transcribe video audio with Whisper, match against subtitle")
-        print("  text, and shift timestamps in two steps:")
-        print("    1. Full bulk shift (uniform offset for all cues)")
-        print("    2. Partial sync (per-section correction on the result)")
+        print("  text, and shift subtitle timestamps to match.")
         print("  With no arguments, processes every video+subtitle pair in")
         print("  the current directory.")
         print("")
+        print("  modes:")
+        print("    -full     (default) single median offset applied to all cues")
+        print("    -partial  full bulk shift, then a per-section correction")
+        print("              interpolated between anchor points on the result")
+        print("")
         print("  options:")
-        print("    -d  save whisper transcript as <video>.whisper.srt")
+        print("    --no-transcript  skip saving the whisper transcript")
+        print("                     (saved by default as <video>.whisper.srt)")
         return
 
+    save_transcript = "--no-transcript" not in argv
+    mode = "partial" if ("-partial" in argv or "--partial" in argv) else "full"
+    flags = ("-full", "--full", "-partial", "--partial", "--no-transcript")
+    args = [a for a in argv if a not in flags]
+
     pairs = resolve_inputs(args)
+    print("[subsync] mode: {0}".format(mode))
     print("[subsync] {0} pair(s) to sync:".format(len(pairs)))
     for video, sub in pairs:
         print("        {0} + {1}".format(video.name, sub.name))
     print()
 
     for video, sub in pairs:
-        sync_one(video, sub, debug=debug)
+        sync_one(video, sub, mode=mode, save_transcript=save_transcript)
 
 
 if __name__ == "__main__":
