@@ -50,6 +50,7 @@ FFMPEG_STATIC_URLS = {
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
 SUBTITLE_EXTS = (".srt", ".vtt")
 SYNCED_TAG = ".synced"
+WHISPER_TAG = ".whisper"
 
 
 # ---------- bootstrap ----------
@@ -661,8 +662,20 @@ def resolve_inputs(args):
 
 # ---------- sync ----------
 
+def _whisper_transcript_path(video, ext=".srt"):
+    return video.with_name(video.stem + WHISPER_TAG + ext)
+
+
+def find_whisper_transcript(video):
+    for ext in SUBTITLE_EXTS:
+        path = _whisper_transcript_path(video, ext)
+        if path.exists():
+            return path
+    return None
+
+
 def _write_whisper_srt(video, segments):
-    path = video.with_name(video.stem + ".whisper.srt")
+    path = _whisper_transcript_path(video, ".srt")
     lines = []
     for i, (start, end, text) in enumerate(segments, 1):
         lines.append(str(i))
@@ -679,15 +692,21 @@ def sync_one(video, subtitle, mode="full", save_transcript=True):
         print("[subsync] no cues found in {0}; skipping".format(subtitle.name))
         return
 
-    language = detect_language(cues)
-    print("[subsync] detected subtitle language: {0}".format(language))
-    whisper_segments = transcribe_audio(video, language)
+    cached = find_whisper_transcript(video)
+    if cached is not None:
+        whisper_segments = parse_cues(cached)
+        print("[subsync] reusing whisper transcript {0} ({1} segment(s))".format(
+            cached.name, len(whisper_segments)))
+    else:
+        language = detect_language(cues)
+        print("[subsync] detected subtitle language: {0}".format(language))
+        whisper_segments = transcribe_audio(video, language)
+        if whisper_segments and save_transcript:
+            _write_whisper_srt(video, whisper_segments)
+
     if not whisper_segments:
         print("[subsync] no speech recognized in {0}; skipping".format(video.name))
         return
-
-    if save_transcript:
-        _write_whisper_srt(video, whisper_segments)
 
     _clean_old_reports(video)
     speech = [(s, e) for s, e, _ in whisper_segments]
@@ -779,7 +798,9 @@ def main():
         print("")
         print("  options:")
         print("    --no-transcript  skip saving the whisper transcript")
-        print("                     (saved by default as <video>.whisper.srt)")
+        print("                     (saved by default as <video>.whisper.srt;")
+        print("                     an existing <video>.whisper.srt/.vtt is")
+        print("                     reused instead of re-transcribing)")
         return
 
     save_transcript = "--no-transcript" not in argv
