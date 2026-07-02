@@ -448,6 +448,14 @@ def _normalize(text):
     return text
 
 
+def _word_overlap(a, b):
+    wa = set(a.split())
+    wb = set(b.split())
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / min(len(wa), len(wb))
+
+
 def _find_matches(whisper_segments, cues, max_samples=30):
     MIN_RATIO = 0.4
 
@@ -461,7 +469,8 @@ def _find_matches(whisper_segments, cues, max_samples=30):
             cn = _normalize(ctext)
             if not cn:
                 continue
-            ratio = difflib.SequenceMatcher(None, wn, cn).ratio()
+            ratio = max(difflib.SequenceMatcher(None, wn, cn).ratio(),
+                        _word_overlap(wn, cn))
             if ratio >= MIN_RATIO:
                 candidates.append((ratio, wi, ci, ws - cs, wtext, ctext, cs))
             elif ratio > best_below:
